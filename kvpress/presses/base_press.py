@@ -18,6 +18,9 @@ from transformers import (
     QuantizedCache,
     Qwen2ForCausalLM,
     Qwen3ForCausalLM,
+    LlavaNextForConditionalGeneration,
+    LlavaNextProcessor,
+    Qwen2AudioForConditionalGeneration,
 )
 
 logger = logging.getLogger(__name__)
@@ -29,6 +32,9 @@ SUPPORTED_MODELS = (
     Qwen2ForCausalLM,
     Qwen3ForCausalLM,
     Gemma3ForCausalLM,
+    LlavaNextForConditionalGeneration,
+    LlavaNextProcessor,
+    Qwen2AudioForConditionalGeneration,
 )
 
 
@@ -123,7 +129,7 @@ class BasePress:
         """
 
         hidden_states = kwargs["hidden_states"]
-        cache = kwargs["past_key_value"]
+        cache = kwargs["past_key_value"] if "past_key_value" in kwargs else kwargs["past_key_values"]
         q_len = hidden_states.shape[1]
 
         # Don't compress after pre-filling
@@ -138,6 +144,8 @@ class BasePress:
             values = cache.value_cache[module.layer_idx]
 
         keys, values = self.compress(module, hidden_states, keys, values, output[1], kwargs)
+
+        #print("keys shape after compression", keys.shape)
 
         if isinstance(cache, QuantizedCache):
             cache._quantized_key_cache[module.layer_idx] = cache._quantize(keys, axis=cache.axis_key)
@@ -182,14 +190,33 @@ class BasePress:
             logger.warning("Compression in Gemma3 is only applied to layer without sliding window attention")
 
         hooks = []
-        try:
-            for layer in model.model.layers:
-                if isinstance(model, Gemma3ForCausalLM) and layer.is_sliding:
-                    # Skip layers with sliding window attention, only for Gemma3
-                    continue
-                layer.self_attn.rotary_emb = model.model.rotary_emb
-                hooks.append(layer.self_attn.register_forward_hook(self.forward_hook, with_kwargs=True))
-            yield
-        finally:
-            for forward_hook in hooks:
-                forward_hook.remove()
+        if isinstance(model, LlavaNextForConditionalGeneration) or isinstance(model, LlavaNextProcessor):
+            try:
+                for layer in model.language_model.layers:
+                    layer.self_attn.rotary_emb = model.language_model.rotary_emb
+                    hooks.append(layer.self_attn.register_forward_hook(self.forward_hook, with_kwargs=True))
+                yield
+            finally:
+                for forward_hook in hooks:
+                    forward_hook.remove()
+        elif isinstance(model, Qwen2AudioForConditionalGeneration):
+            try:
+                for layer in model.language_model.model.layers:
+                    layer.self_attn.rotary_emb = model.language_model.model.rotary_emb
+                    hooks.append(layer.self_attn.register_forward_hook(self.forward_hook, with_kwargs=True))
+                yield
+            finally:
+                for forward_hook in hooks:
+                    forward_hook.remove()
+        else:
+            try:
+                for layer in model.model.layers:
+                    if isinstance(model, Gemma3ForCausalLM) and layer.is_sliding:
+                        # Skip layers with sliding window attention, only for Gemma3
+                        continue
+                    layer.self_attn.rotary_emb = model.model.rotary_emb
+                    hooks.append(layer.self_attn.register_forward_hook(self.forward_hook, with_kwargs=True))
+                yield
+            finally:
+                for forward_hook in hooks:
+                    forward_hook.remove()
