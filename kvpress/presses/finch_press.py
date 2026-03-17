@@ -24,6 +24,8 @@ class FinchPress(BasePress):
 
     Use `update_model_and_tokenizer` method to set delimiter token before use.
 
+    Supports both text-only and multimodal (vision-language) models. The model
+    type is detected automatically based on the model architecture.
 
     Based on FINCH (https://direct.mit.edu/tacl/article/doi/10.1162/tacl_a_00716/125280).
 
@@ -52,6 +54,7 @@ class FinchPress(BasePress):
     delimiter_token: str = field(default=None, init=False)
     delimiter_token_id: int = field(default=None, init=False)
     window_size: int = field(default=None, init=False)
+    _is_multimodal: bool = field(default=False, init=False, repr=False)
 
     def score(self, module, hidden_states, keys, values, attentions, kwargs):
         """
@@ -95,7 +98,7 @@ class FinchPress(BasePress):
         scores = self.score(module, hidden_states, keys, values, attentions, kwargs)
 
         # Compute indices to keep (optionally by chunks)
-        k_len = keys.shape[2]  # Use actual sequence length from keys instead of hidden_states
+        k_len = keys.shape[2]
         if self.chunk_length is None:
             n_kept = int(k_len * (1 - self.compression_ratio))
             indices = scores.topk(n_kept, dim=-1).indices
@@ -122,18 +125,22 @@ class FinchPress(BasePress):
 
     def embed_token_forward_hook(self, module, input, output):
         """
-        Forward hook to detect a delimiter token between the context and the window
+        Forward hook to detect a delimiter token between the context and the window.
+        For text-only models, also removes the delimiter token from the output embeddings.
         """
-        if input[0].shape[1] > 1 and self.delimiter_token_id in input[0][0]:  # prefilling
-            assert len(input[0]) == 1, "Only batch size 1 is supported."
-            # Find the delimiter token and compute the window size
-            delim_tokens = input[0][0] == self.delimiter_token_id
-            assert delim_tokens.sum() == 1, "Only one delimiter token should be present."
-            context_length = int(torch.nonzero(delim_tokens)[0].item())
-            self.window_size = len(input[0][0]) - 1 - context_length
-            assert self.window_size > 0, "No window detected (window size must be > 0)."
-            # Remove the delimiter token from the output
-            output = output[:, ~delim_tokens]
+        if input[0].shape[1] > 1:  # prefilling
+            input_ids = input[0][0]
+            input_ids_list = input_ids.tolist()
+
+            if self.delimiter_token_id in input_ids_list:
+                assert len(input[0]) == 1, "Only batch size 1 is supported."
+                delim_tokens = input_ids == self.delimiter_token_id
+                assert delim_tokens.sum() == 1, "Only one delimiter token should be present."
+                context_length = int(torch.nonzero(delim_tokens)[0].item())
+                self.window_size = len(input_ids) - 1 - context_length
+                assert self.window_size > 0, "No window detected (window size must be > 0)."
+                if not self._is_multimodal:
+                    output = output[:, ~delim_tokens]
         return output
 
     def update_model_and_tokenizer(self, model, tokenizer, delimiter_token: str = "<|finch_sep|>"):
@@ -158,9 +165,13 @@ class FinchPress(BasePress):
                              Use the update_model_and_tokenizer method before calling the press."""
             )
 
+        # Auto-detect multimodal models (e.g. vision-language) by checking for language_model submodule
+        self._is_multimodal = hasattr(model, "language_model")
+        embed_tokens = model.language_model.embed_tokens if self._is_multimodal else model.model.embed_tokens
+
         with super().__call__(model):
             try:
-                hook = model.model.embed_tokens.register_forward_hook(self.embed_token_forward_hook)
+                hook = embed_tokens.register_forward_hook(self.embed_token_forward_hook)
                 yield
             finally:
                 hook.remove()
