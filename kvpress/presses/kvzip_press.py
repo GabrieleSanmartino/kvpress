@@ -6,17 +6,15 @@ import math
 from contextlib import contextmanager
 from dataclasses import dataclass
 from types import MethodType
-from typing import Any, Generator, List, cast
+from typing import Generator, List
 
 import torch
 from torch import nn
-from transformers import AutoTokenizer, Gemma3ForCausalLM, PreTrainedModel, PreTrainedTokenizer, QuantizedCache
-from transformers.models.gemma3.modeling_gemma3 import Gemma3Attention
+from transformers import AutoTokenizer, Gemma3PreTrainedModel, PreTrainedModel, PreTrainedTokenizer, QuantizedCache
 from transformers.models.llama.modeling_llama import rotate_half
-from transformers.models.phi3.modeling_phi3 import Phi3Attention
-from transformers.models.qwen3.modeling_qwen3 import Qwen3Attention
 
 from kvpress.presses.base_press import SUPPORTED_MODELS, BasePress
+from kvpress.utils import extract_keys_and_values, get_prerope_query_states
 
 logger = logging.getLogger(__name__)
 
@@ -45,11 +43,14 @@ class KVzipPress(BasePress):
         each layer has a different compression ratio.
     n_sink : int, default=4
         Number of initial tokens to preserve as attention sinks.
+    kvzip_plus_normalization: bool, default=False
+        Whether to enable KVzip+ normalization.
     """
 
     compression_ratio: float = 0.0
     layerwise: bool = False
     n_sink: int = 4
+    kvzip_plus_normalization: bool = False
 
     def __post_init__(self):
         assert 0 <= self.compression_ratio < 1, "Compression ratio must be between 0 and 1"
@@ -86,8 +87,8 @@ class KVzipPress(BasePress):
         if not isinstance(model, SUPPORTED_MODELS):
             logger.warning(f"Model {type(model)} not tested, supported models: {SUPPORTED_MODELS}")
 
-        if isinstance(model, Gemma3ForCausalLM):
-            logger.warning("Compression in Gemma3 is only applied to layer without sliding window attention")
+        if isinstance(model, Gemma3PreTrainedModel):
+            raise ValueError("KVzipPress is not supported for Gemma3ForCausalLM")
 
         # Store model reference for later use
         tokenizer = AutoTokenizer.from_pretrained(model.config.name_or_path)
@@ -132,8 +133,6 @@ class KVzipPress(BasePress):
             if self.compression_ratio > 0 and self._context_ids is not None:
                 # Now register attention hooks for compression
                 for layer in model.model.layers:
-                    if isinstance(model, Gemma3ForCausalLM) and layer.is_sliding:
-                        continue
                     layer.self_attn.rotary_emb = model.model.rotary_emb
                     hooks.append(layer.self_attn.register_forward_hook(self.forward_hook, with_kwargs=True))
 
@@ -151,29 +150,25 @@ class KVzipPress(BasePress):
         """
 
         hidden_states = kwargs["hidden_states"]
-        cache = kwargs["past_key_value"]
+        cache = kwargs.get("past_key_values", None) or kwargs.get("past_key_value", None)
+        cache_layer = cache.layers[module.layer_idx]
 
-        if isinstance(cache, QuantizedCache):
-            keys = cache._dequantize(cache._quantized_key_cache[module.layer_idx])  # type: ignore[attr-defined]
-            values = cache._dequantize(cache._quantized_value_cache[module.layer_idx])  # type: ignore[attr-defined]
-        else:
-            keys = cache.key_cache[module.layer_idx]
-            values = cache.value_cache[module.layer_idx]
+        keys, values = extract_keys_and_values(cache, module.layer_idx)
 
         # Compute importance scores for KV pairs in the prefilled context,
         # retaining only the originally prefilled KV pairs.
         keys, values = self.score_kvzip(module, hidden_states, keys, values, output[1], kwargs)
 
         if isinstance(cache, QuantizedCache):
-            cache = cast(Any, cache)  # to ignore attr-defined style errors
-            cache._quantized_key_cache[module.layer_idx] = cache._quantize(keys, axis=cache.axis_key)
-            cache._quantized_value_cache[module.layer_idx] = cache._quantize(values, axis=cache.axis_value)
-            cache.key_cache[module.layer_idx] = torch.zeros(0, dtype=keys.dtype, device=keys.device)
-            cache.value_cache[module.layer_idx] = torch.zeros(0, dtype=keys.dtype, device=keys.device)
-            cache._seen_tokens = keys.shape[2]
+            # Update cache with compressed keys and values
+            cache_layer._quantized_keys = cache_layer._quantize(keys, axis=cache_layer.axis_key)
+            cache_layer._quantized_values = cache_layer._quantize(values, axis=cache_layer.axis_value)
+            cache_layer.keys = torch.zeros(0, dtype=keys.dtype, device=keys.device)  # type: ignore[index]
+            cache_layer.values = torch.zeros(0, dtype=keys.dtype, device=keys.device)  # type: ignore[index]
+            cache_layer.cumulative_length = keys.shape[2]
         else:
-            cache.key_cache[module.layer_idx] = keys
-            cache.value_cache[module.layer_idx] = values
+            cache_layer.keys = keys
+            cache_layer.values = values
 
         return output
 
@@ -282,6 +277,7 @@ class KVzipPress(BasePress):
         elif self.causal_mask_score.size(-1) != window_size:
             self._make_mask(attn_weights, window_size)
 
+        self.causal_mask_score = self.causal_mask_score.to(attn_weights.device)
         attn_weights[..., -window_size:, -window_size:] += self.causal_mask_score
 
     def score_kvzip(
@@ -306,20 +302,7 @@ class KVzipPress(BasePress):
         head_dim = module.head_dim
         num_key_value_groups = num_heads // num_heads_kv
 
-        if isinstance(module, Phi3Attention):
-            qkv = module.qkv_proj(hidden_states)
-            queries = qkv[..., : num_heads * head_dim]
-        elif hasattr(module, "q_proj"):
-            # Assume Llama-like attention layer
-            queries = module.q_proj(hidden_states)
-        else:
-            raise NotImplementedError(f"KVzip not yet implemented for {module.__class__}.")
-
-        queries = queries.view(bsz, q_len, num_heads, head_dim).transpose(1, 2)
-
-        # Support for Qwen3 and Gemma3 QK norm
-        if isinstance(module, (Qwen3Attention, Gemma3Attention)):
-            queries = module.q_norm(queries)
+        queries = get_prerope_query_states(module, hidden_states)
 
         # Apply RoPE
         cos, sin = kwargs["position_embeddings"]
@@ -344,6 +327,22 @@ class KVzipPress(BasePress):
         self._mask_causal(attn_weights, q_len)
         attn_weights = nn.functional.softmax(attn_weights, dim=-1)
 
+        if self.kvzip_plus_normalization:
+            # Divide by ||h|| (by row)
+            h_norm = torch.norm(hidden_states, dim=-1)
+            attn_weights = torch.einsum("b h g t i, b t -> b h g t i", attn_weights, 1 / h_norm)
+
+            # Multiply by ||WoV|| (by column)
+            Wo = module.o_proj.weight.transpose(0, 1)
+            Wo = Wo.view(num_heads_kv, num_key_value_groups, module.head_dim, module.config.hidden_size)
+            values_subsampled = torch.cat(
+                [values[:, :, :sink], values[:, :, self.start_idx : self.end_idx], values[:, :, -q_len:]], dim=2
+            )
+            values_subsampled = values_subsampled.unsqueeze(2).transpose(-2, -1).contiguous()
+            V = values_subsampled.repeat_interleave(module.num_key_value_groups, axis=2)
+            WoV_norm = torch.einsum("h g i j, b h g i t -> b h g t j", Wo, V).norm(dim=-1)
+            attn_weights = torch.einsum("b h g i t, b h g t -> b h g i t", attn_weights, WoV_norm)
+
         attn_weights = attn_weights[..., sink : sink + ctx_len]
         scores = attn_weights.amax(dim=(-3, -2))  # max over group, q
 
@@ -364,19 +363,15 @@ class KVzipPress(BasePress):
 
             # calculate the pruned KV pairs across layers
             if self.layerwise:
-                nl = int(num_key_value_heads * ctx_len * self.compression_ratio)
+                nl = int(bsz * num_key_value_heads * ctx_len * self.compression_ratio)
                 n_pruned_layers = nl * torch.ones(n_layer, device=self.score_val.device, dtype=torch.int)
             else:
-                score_sort = torch.sort(self.score_val.reshape(-1)).values  # ascending order
-                n = max(int(len(score_sort) * self.compression_ratio) - 1, 0)
-                thres = score_sort[n].item()
-
-                n_pruned_layers = (self.score_val.reshape(n_layer, -1) <= thres).sum(-1)  # n_prune
+                n_pruned_indices = int(self.score_val.numel() * self.compression_ratio)
+                pruned_indices = torch.topk(-self.score_val.reshape(-1), n_pruned_indices).indices
+                n_tokens_per_layer = bsz * num_key_value_heads * ctx_len
+                n_pruned_layers = torch.bincount(pruned_indices // n_tokens_per_layer, minlength=n_layer).int()
 
             for layer in model.model.layers:
-                if isinstance(model, Gemma3ForCausalLM) and layer.is_sliding:
-                    # Skip layers with sliding window attention, only for Gemma3
-                    continue
                 module = layer.self_attn
                 layer_idx = int(module.layer_idx)
 
@@ -385,8 +380,8 @@ class KVzipPress(BasePress):
                 scores = self.score_val[layer_idx]
 
                 # Compute bottom-k across heads
-                n_pruned = n_pruned_layers[layer_idx]
-                indices = torch.topk(-scores.reshape(bsz, -1), n_pruned, dim=1).indices.flatten()
+                n_pruned = n_pruned_layers[layer_idx].cpu()
+                indices = torch.topk(-scores.reshape(bsz, -1), n_pruned, dim=1).indices.flatten().cpu()
 
                 # Save indices to mask during the attention mechanism. Please refer to attention_patch.py for details
                 batch_indices = torch.arange(bsz, device=n_pruned.device).repeat_interleave(n_pruned)

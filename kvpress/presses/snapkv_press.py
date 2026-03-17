@@ -8,12 +8,10 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 from torch.nn import functional as F
-from transformers.models.gemma3.modeling_gemma3 import Gemma3Attention
 from transformers.models.llama.modeling_llama import repeat_kv, rotate_half
-from transformers.models.phi3.modeling_phi3 import Phi3Attention
-from transformers.models.qwen3.modeling_qwen3 import Qwen3Attention
 
 from kvpress.presses.scorer_press import ScorerPress
+from kvpress.utils import get_prerope_query_states
 
 
 @dataclass
@@ -46,26 +44,13 @@ class SnapKVPress(ScorerPress):
         Compute the last window_size queries and associated attention weights for the first q_len - window_size keys.
         """
 
-        bsz, q_len, _ = hidden_states.shape
+        bsz, _, k_len, _ = keys.shape
         num_heads = module.config.num_attention_heads
         head_dim = module.head_dim
         num_key_value_groups = num_heads // module.config.num_key_value_heads
 
         # Get last window_size queries
-        if isinstance(module, Phi3Attention):
-            qkv = module.qkv_proj(hidden_states[:, -window_size:])
-            query_states = qkv[..., : num_heads * head_dim]
-        elif hasattr(module, "q_proj"):
-            # Assume Llama-like attention layer
-            query_states = module.q_proj(hidden_states[:, -window_size:])
-        else:
-            raise NotImplementedError(f"SnapKV not yet implemented for {module.__class__}.")
-
-        query_states = query_states.view(bsz, window_size, num_heads, head_dim).transpose(1, 2)
-
-        # Support for Qwen3 and Gemma3 QK norm
-        if isinstance(module, (Qwen3Attention, Gemma3Attention)):
-            query_states = module.q_norm(query_states)
+        query_states = get_prerope_query_states(module, hidden_states[:, -window_size:])
 
         # Apply RoPE
         cos, sin = position_embeddings
@@ -76,7 +61,7 @@ class SnapKVPress(ScorerPress):
         key_states = repeat_kv(keys, num_key_value_groups)
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(head_dim)
         attention_mask = torch.ones_like(attn_weights) * float("-inf")
-        attention_mask = torch.triu(attention_mask, diagonal=q_len - window_size + 1)
+        attention_mask = torch.triu(attention_mask, diagonal=k_len - window_size + 1)
         attn_weights += attention_mask
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
         attn_weights = attn_weights[..., :-window_size]
@@ -93,10 +78,12 @@ class SnapKVPress(ScorerPress):
         kwargs,
     ) -> torch.Tensor:
 
-        bsz, num_key_value_heads, q_len, _ = keys.shape
+        bsz, num_key_value_heads, k_len, _ = keys.shape
         num_key_value_groups = module.config.num_attention_heads // num_key_value_heads
 
-        assert q_len > self.window_size, "Query length should be greater than the window size"
+        assert (
+            hidden_states.shape[1] > self.window_size
+        ), f"Query length {hidden_states.shape[1]} should be greater than the window size {self.window_size}"
 
         if attentions is not None:
             attn_weights = attentions[..., -self.window_size :, : -self.window_size]
@@ -109,7 +96,7 @@ class SnapKVPress(ScorerPress):
         scores = F.avg_pool1d(scores, kernel_size=self.kernel_size, padding=self.kernel_size // 2, stride=1)
 
         # Average per group (https://github.com/FasterDecoding/SnapKV/issues/22)
-        scores = scores.view(bsz, num_key_value_heads, num_key_value_groups, q_len - self.window_size)
+        scores = scores.view(bsz, num_key_value_heads, num_key_value_groups, k_len - self.window_size)
         scores = scores.mean(2)
 
         # Add back the observation window. Use max score to make sure the window is not pruned.

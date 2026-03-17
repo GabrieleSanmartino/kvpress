@@ -6,12 +6,10 @@ from dataclasses import dataclass
 
 import torch
 from torch import nn
-from transformers.models.gemma3.modeling_gemma3 import Gemma3Attention
 from transformers.models.llama.modeling_llama import rotate_half
-from transformers.models.phi3.modeling_phi3 import Phi3Attention
-from transformers.models.qwen3.modeling_qwen3 import Qwen3Attention
 
 from kvpress.presses.base_press import BasePress
+from kvpress.utils import get_prerope_query_states
 
 
 @dataclass
@@ -46,25 +44,8 @@ class ThinKPress(BasePress):
         """
         Re-compute the last window_size query states
         """
-        bsz, q_len, _ = hidden_states.shape
-        num_heads = module.config.num_attention_heads
-        head_dim = module.head_dim
-
         # Get last self.window_size queries
-        if isinstance(module, Phi3Attention):
-            qkv = module.qkv_proj(hidden_states[:, -self.window_size :])
-            query_states = qkv[..., : num_heads * head_dim]
-        elif hasattr(module, "q_proj"):
-            # Assume Llama-like attention layer
-            query_states = module.q_proj(hidden_states[:, -self.window_size :])
-        else:
-            raise NotImplementedError(f"SnapKV not yet implemented for {module.__class__}.")
-
-        query_states = query_states.view(bsz, self.window_size, num_heads, head_dim).transpose(1, 2)
-
-        # Support for Qwen3 and Gemma3 QK norm
-        if isinstance(module, (Qwen3Attention, Gemma3Attention)):
-            query_states = module.q_norm(query_states)
+        query_states = get_prerope_query_states(module, hidden_states[:, -self.window_size :])
 
         # Apply RoPE
         cos, sin = position_embeddings
@@ -91,7 +72,7 @@ class ThinKPress(BasePress):
             return keys, values
 
         # Compute scores per dimension
-        bsz, num_key_value_heads, q_len, head_dim = keys.shape
+        bsz, num_key_value_heads, k_len, head_dim = keys.shape
         num_key_value_groups = module.config.num_attention_heads // num_key_value_heads
 
         queries = self.compute_window_queries(module, kwargs["hidden_states"], kwargs["position_embeddings"])
@@ -103,7 +84,7 @@ class ThinKPress(BasePress):
         # Prune dimensions with the lowest scores by setting them to 0
         n_pruned = int(head_dim * self.key_channel_compression_ratio)
         indices = key_scores.topk(n_pruned, dim=-1, largest=False).indices
-        indices = indices.unsqueeze(2).expand(-1, -1, q_len, -1)
+        indices = indices.unsqueeze(2).expand(-1, -1, k_len, -1)
         keys = keys.scatter_(-1, indices, 0)
 
         return keys, values
