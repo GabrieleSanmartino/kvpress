@@ -68,6 +68,7 @@ class KVzipPress(BasePress):
 
         self._suffix_ids = None
         self._context_ids = None
+        self._actual_context_length = None  # set for multimodal (image expansion)
         self._cache = None
 
         self.score_val = None
@@ -118,8 +119,17 @@ class KVzipPress(BasePress):
         original_forward = model.model.forward
 
         def wrapped_forward(model_self, *args, **kwargs):
-            self._context_ids = kwargs["input_ids"]
-            self._cache = kwargs["past_key_values"]
+            input_ids = kwargs.get("input_ids")
+            inputs_embeds = kwargs.get("inputs_embeds")
+            self._cache = kwargs.get("past_key_values")
+            if input_ids is not None:
+                self._context_ids = input_ids
+            elif inputs_embeds is not None:
+                # Multimodal models (e.g. LlavaNext) merge image features into
+                # inputs_embeds before calling model.model, so input_ids is None
+                # here. Capture the actual expanded sequence length; the text
+                # input_ids are injected from outside (engine._run_kvzip).
+                self._actual_context_length = inputs_embeds.shape[1]
             return original_forward(*args, **kwargs)
 
         model.model.forward = MethodType(wrapped_forward, model.model)
@@ -177,15 +187,27 @@ class KVzipPress(BasePress):
         Perform the KVzip scoring and compression algorithm.
         """
 
-        # Prepare chunked inputs for context reconstruction
-        self.context_length = self._context_ids.shape[1]
+        # For multimodal (image) inputs, LlavaNext expands the <image> placeholder
+        # into N vision tokens, making the actual cache longer than context_ids.
+        # Use _actual_context_length (from inputs_embeds) when available.
+        if self._actual_context_length is not None:
+            self.context_length = self._actual_context_length
+        else:
+            self.context_length = self._context_ids.shape[1]
+
         chunked_context_pairs = self.prepare(model, tokenizer)
 
         # Perform scoring through context reconstruction
         # Use the stored cache from the initial forward pass
         self.start_idx = self.prefix_length
         for prefill_ids, repeat_ids in chunked_context_pairs:
-            self.end_idx = self.start_idx + prefill_ids.shape[1]
+            if self._actual_context_length is not None:
+                # Multimodal: prefill_ids are text tokens whose length doesn't
+                # correspond to cache positions (image expansion shifted them).
+                # Score the full expanded cache range in one pass instead.
+                self.end_idx = self._actual_context_length
+            else:
+                self.end_idx = self.start_idx + prefill_ids.shape[1]
             # Pass the cache that was used in the initial forward pass
             model(
                 input_ids=repeat_ids.to(model.device),
@@ -242,6 +264,10 @@ class KVzipPress(BasePress):
             device=model.device,
         )
         self.score_val[..., : self.n_sink] = 1.0
+        # For multimodal, protect all prefix tokens (BOS, system, user header)
+        # not just the first n_sink, since image features shift their positions.
+        if self._actual_context_length is not None:
+            self.score_val[..., : self.prefix_length] = 1.0
 
         chunked_context_pairs = []
         chunked_input_ids = self._chunk_fn(ctx_ids, chunk_size)
