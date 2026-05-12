@@ -7,17 +7,24 @@ import logging
 from typing import Optional, Any
 
 import torch
-from transformers import AutoModelForCausalLM, Cache, DynamicCache, Pipeline, AutoProcessor
+from transformers import (
+    AutoModelForCausalLM,
+    Cache,
+    DynamicCache,
+    Pipeline,
+    AutoProcessor,
+)
 from transformers.pipelines import PIPELINE_REGISTRY
 from transformers.pipelines.base import GenericTensor
 
 from kvpress.presses.base_press import BasePress
+from kvpress.presses.decoding_press import DecodingPress
+from kvpress.presses.dms_press import DMSPress
 from kvpress.presses.finch_press import FinchPress
 from kvpress.presses.key_rerotation_press import KeyRerotationPress
 from kvpress.presses.observed_attention_press import ObservedAttentionPress
 from kvpress.presses.per_layer_compression_press import PerLayerCompressionPress
 from kvpress.presses.prefill_decoding_press import PrefillDecodingPress
-from kvpress.presses.dms_press import DMSPress
 
 logger = logging.getLogger(__name__)
 
@@ -44,15 +51,21 @@ class KVPressTextGenerationPipeline(Pipeline):
     ):
         answer_prefix = answer_prefix or ""
         postprocess_kwargs = {"single_question": questions is None}
-        assert question is None or questions is None, "Either question or questions should be provided, not both."
-        
+        assert question is None or questions is None, (
+            "Either question or questions should be provided, not both."
+        )
+
         # Ensure we don't process both image and audio at the same time for now
-        assert not (image is not None and audio is not None), "Provide either an image OR audio, but not both."
+        assert not (image is not None and audio is not None), (
+            "Provide either an image OR audio, but not both."
+        )
 
         questions = questions or ([question] if question else [""])
         if max_context_length is None:
-            max_context_length = min(self.tokenizer.model_max_length, int(1e10))  # 1e10 to avoid overflow
-        
+            max_context_length = min(
+                self.tokenizer.model_max_length, int(1e10)
+            )  # 1e10 to avoid overflow
+
         preprocess_kwargs = {
             "questions": questions,
             "answer_prefix": answer_prefix,
@@ -60,7 +73,11 @@ class KVPressTextGenerationPipeline(Pipeline):
             "image": image,
             "audio": audio,
         }
-        forward_kwargs = {"press": press, "max_new_tokens": max_new_tokens, "cache": cache}
+        forward_kwargs = {
+            "press": press,
+            "max_new_tokens": max_new_tokens,
+            "cache": cache,
+        }
         return preprocess_kwargs, forward_kwargs, postprocess_kwargs
 
     def preprocess(
@@ -73,11 +90,11 @@ class KVPressTextGenerationPipeline(Pipeline):
         audio: Optional[Any] = None,
     ):
         """
-        Apply chat template and tokenize. 
+        Apply chat template and tokenize.
         Handles Text-only, Image inputs, or Audio inputs via AutoProcessor.
         """
         separator = "\n" + "#" * len(context)
-        
+
         # 1. Handle Image Input
         if image is not None:
             processor = AutoProcessor.from_pretrained(self.model.name_or_path)
@@ -90,11 +107,13 @@ class KVPressTextGenerationPipeline(Pipeline):
                     ],
                 }
             ]
-            prompt = processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+            prompt = processor.apply_chat_template(
+                messages, add_generation_prompt=True, tokenize=False
+            )
             context_for_proc, question_suffix = prompt.split(separator)
 
             processed_inputs = processor(text=prompt, images=image, return_tensors="pt")
-            
+
             # Prepare return dict
             result = {
                 "context_ids": processed_inputs["input_ids"],
@@ -115,17 +134,23 @@ class KVPressTextGenerationPipeline(Pipeline):
                     ],
                 }
             ]
-            prompt = processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+            prompt = processor.apply_chat_template(
+                messages, add_generation_prompt=True, tokenize=False
+            )
             context_for_proc, question_suffix = prompt.split(separator)
 
-            processed_inputs = processor(text=prompt, audio=[audio], return_tensors="pt", padding=True)
+            processed_inputs = processor(
+                text=prompt, audio=[audio], return_tensors="pt", padding=True
+            )
 
             # Prepare return dict (Extract common audio features)
             result = {
                 "context_ids": processed_inputs["input_ids"],
                 "attention_mask": processed_inputs.get("attention_mask"),
                 "input_features": processed_inputs.get("input_features"),
-                "feature_attention_mask": processed_inputs.get("feature_attention_mask"),
+                "feature_attention_mask": processed_inputs.get(
+                    "feature_attention_mask"
+                ),
             }
 
         # 3. Handle Text-Only Input
@@ -142,34 +167,35 @@ class KVPressTextGenerationPipeline(Pipeline):
                     enable_thinking=False,
                 )
                 context, question_suffix = context.split(separator)
-            
-            context_ids = self.tokenizer.encode(context, return_tensors="pt", add_special_tokens=False)
-            
+
+            context_ids = self.tokenizer.encode(
+                context, return_tensors="pt", add_special_tokens=False
+            )
+
             # Truncate context for text-only path
             if context_ids.shape[1] > max_context_length:
                 logger.warning(
                     f"Context length truncated from {context_ids.shape[1]} to {max_context_length} tokens."
                 )
                 context_ids = context_ids[:, :max_context_length]
-                
+
             result = {"context_ids": context_ids}
 
-        
-        questions_processed = [question + question_suffix + answer_prefix for question in questions]
-        
-        
+        questions_processed = [
+            question + question_suffix + answer_prefix for question in questions
+        ]
+
         if image is not None or audio is not None:
-         
-             question_ids_list = [
-                 self.tokenizer.encode(
-                    questions_processed[0], 
-                    return_tensors="pt", 
-                    add_special_tokens=False
+            question_ids_list = [
+                self.tokenizer.encode(
+                    questions_processed[0],
+                    return_tensors="pt",
+                    add_special_tokens=False,
                 )
-             ]
+            ]
         else:
             question_ids_list = [
-                self.tokenizer.encode(q, return_tensors="pt", add_special_tokens=False) 
+                self.tokenizer.encode(q, return_tensors="pt", add_special_tokens=False)
                 for q in questions_processed
             ]
 
@@ -189,38 +215,45 @@ class KVPressTextGenerationPipeline(Pipeline):
         # Extract multimodal tensors if they exist
         pixel_values = input_tensors.get("pixel_values")
         image_sizes = input_tensors.get("image_sizes")
-        
+
         # Extract audio tensors
         input_features = input_tensors.get("input_features")
         feature_attention_mask = input_tensors.get("feature_attention_mask")
-        
+
         attention_mask = input_tensors.get("attention_mask")
 
         # Move to device
-        if pixel_values is not None: pixel_values = pixel_values.to(self.model.device)
-        if image_sizes is not None: image_sizes = image_sizes.to(self.model.device)
-        if input_features is not None: input_features = input_features.to(self.model.device)
-        if feature_attention_mask is not None: feature_attention_mask = feature_attention_mask.to(self.model.device)
-        if attention_mask is not None: attention_mask = attention_mask.to(self.model.device)
+        if pixel_values is not None:
+            pixel_values = pixel_values.to(self.model.device)
+        if image_sizes is not None:
+            image_sizes = image_sizes.to(self.model.device)
+        if input_features is not None:
+            input_features = input_features.to(self.model.device)
+        if feature_attention_mask is not None:
+            feature_attention_mask = feature_attention_mask.to(self.model.device)
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(self.model.device)
 
         # Prefilling
         if cache is None:
             cache = DynamicCache()
 
-        ctx_manager = press(self.model) if press is not None else contextlib.nullcontext()
+        ctx_manager = (
+            press(self.model) if press is not None else contextlib.nullcontext()
+        )
         with ctx_manager:
             model_call_kwargs = {
                 "input_ids": context_ids,
                 "past_key_values": cache,
                 "output_attentions": self.output_attentions(press),
             }
-            
+
             # Add Image args
             if pixel_values is not None:
                 model_call_kwargs["pixel_values"] = pixel_values
             if image_sizes is not None:
                 model_call_kwargs["image_sizes"] = image_sizes
-            
+
             # Add Audio args
             if input_features is not None:
                 model_call_kwargs["input_features"] = input_features
@@ -232,16 +265,18 @@ class KVPressTextGenerationPipeline(Pipeline):
             # Add common args
             if attention_mask is not None:
                 model_call_kwargs["attention_mask"] = attention_mask
-                
-            self.model(**model_call_kwargs) # For Qwen2Audio
-            #self.model.model(**model_call_kwargs) # For Llava and Llama
+
+            self.model(**model_call_kwargs)  # For Qwen2Audio
+            # self.model.model(**model_call_kwargs) # For Llava and Llama
 
             logger.debug(f"Context Length: {context_length}")
             logger.debug(f"Compressed Context Length: {cache.get_seq_length()}")
 
         answers = []
         for question_ids in input_tensors["questions_ids"]:
-            if isinstance(press, KeyRerotationPress) or (isinstance(press, FinchPress) and press.rerotate_keys):
+            if isinstance(press, KeyRerotationPress) or (
+                isinstance(press, FinchPress) and press.rerotate_keys
+            ):
                 context_length = cache.get_seq_length()
 
             answer = self.generate_answer(
@@ -257,9 +292,9 @@ class KVPressTextGenerationPipeline(Pipeline):
     def output_attentions(self, press: BasePress):
         if isinstance(press, ObservedAttentionPress):
             return True
-        if isinstance(press, (KeyRerotationPress, PerLayerCompressionPress)) and isinstance(
-            press.press, ObservedAttentionPress
-        ):
+        if isinstance(
+            press, (KeyRerotationPress, PerLayerCompressionPress)
+        ) and isinstance(press.press, ObservedAttentionPress):
             return True
         return False
 
@@ -268,20 +303,30 @@ class KVPressTextGenerationPipeline(Pipeline):
             return {"answer": model_outputs[0]}
         return {"answers": model_outputs}
 
-    def generate_answer(self, question_ids: torch.Tensor, cache: Cache, context_length: int, max_new_tokens: int) -> str:
+    def generate_answer(
+        self,
+        question_ids: torch.Tensor,
+        cache: Cache,
+        context_length: int,
+        max_new_tokens: int,
+    ) -> str:
 
         question_ids = question_ids.to(self.model.device)
         position_ids = torch.arange(
-            context_length, context_length + question_ids.shape[1], device=self.model.device
+            context_length,
+            context_length + question_ids.shape[1],
+            device=self.model.device,
         ).unsqueeze(0)
 
-        cache_seq_lengths = [cache.get_seq_length(layer_idx) for layer_idx in range(len(cache))]
+        cache_seq_lengths = [
+            cache.get_seq_length(layer_idx) for layer_idx in range(len(cache))
+        ]
 
         outputs = self.model(
             input_ids=question_ids,
             past_key_values=cache,
             position_ids=position_ids,
-            #num_logits_to_keep=1, # Not used  for Qwen2Audio
+            # num_logits_to_keep=1, # Not used  for Qwen2Audio
         )
 
         generated_ids = []
@@ -335,3 +380,4 @@ PIPELINE_REGISTRY.register_pipeline(
     pipeline_class=KVPressTextGenerationPipeline,
     pt_model=AutoModelForCausalLM,
 )
+

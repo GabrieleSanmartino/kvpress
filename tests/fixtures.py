@@ -20,9 +20,7 @@ def unit_test_model():
 
 @pytest.fixture(scope="session")
 def unit_test_model_output_attention():
-    model = AutoModelForCausalLM.from_pretrained(
-        "MaxJeblick/llama2-0b-unit-test", attn_implementation="eager"
-    ).eval()
+    model = AutoModelForCausalLM.from_pretrained("MaxJeblick/llama2-0b-unit-test", attn_implementation="eager").eval()
     return model.to(get_device())
 
 
@@ -82,7 +80,9 @@ def kv_press_llama3_1_flash_attn_pipeline():
         device=device,
         model_kwargs={"attn_implementation": attn_implementation, "dtype": torch.bfloat16},
     )
-    return pipe
+    yield pipe
+    del pipe
+    torch.cuda.empty_cache()
 
 
 @pytest.fixture(scope="class")
@@ -96,7 +96,9 @@ def kv_press_llama3_2_flash_attn_pipeline():
         device=device,
         model_kwargs={"attn_implementation": attn_implementation, "dtype": torch.bfloat16},
     )
-    return pipe
+    yield pipe
+    del pipe
+    torch.cuda.empty_cache()
 
 
 @pytest.fixture(scope="class")
@@ -110,4 +112,6 @@ def kv_press_qwen3_flash_attn_pipeline():
         device=device,
         model_kwargs={"attn_implementation": attn_implementation, "dtype": torch.bfloat16},
     )
-    return pipe
+    yield pipe
+    del pipe
+    torch.cuda.empty_cache()
